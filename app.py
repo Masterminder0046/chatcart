@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
 VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
-APP_SECRET = os.getenv("META_APP_SECRET", "")
+APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "").strip()
 
 
 @app.get("/")

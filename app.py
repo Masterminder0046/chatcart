@@ -10,12 +10,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 
-VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
-APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "").strip()
+VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "").strip()
+META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
+INSTAGRAM_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "").strip()
 
 
 @app.get("/")
@@ -28,78 +28,82 @@ def health_check():
 
 @app.get("/webhooks/instagram")
 def verify_webhook():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
+    mode = request.args.get("hub.mode", "")
+    token = request.args.get("hub.verify_token", "")
     challenge = request.args.get("hub.challenge")
 
     if (
         mode == "subscribe"
         and VERIFY_TOKEN
-        and hmac.compare_digest(token or "", VERIFY_TOKEN)
+        and hmac.compare_digest(token, VERIFY_TOKEN)
         and challenge is not None
     ):
         app.logger.info("Instagram webhook verified")
-        return Response(
-            challenge,
-            status=200,
-            mimetype="text/plain"
-        )
+        return Response(challenge, status=200, mimetype="text/plain")
 
     app.logger.warning("Instagram webhook verification failed")
     return Response("Verification failed", status=403)
 
 
-@app.post("/webhooks/instagram")
-def receive_webhook():
-    # Read the exact raw request body before parsing JSON.
-    raw_body = request.get_data(cache=True)
+def signature_matches(secret, signature, raw_body):
+    """Validate Meta's X-Hub-Signature-256 header."""
+    if not secret or not signature.startswith("sha256="):
+        return False
 
-    signature = request.headers.get(
-        "X-Hub-Signature-256", ""
-    )
-
-    # Safe diagnostic logs: never log the secret or full signature.
-    app.logger.info(
-        "Webhook signature diagnostic: header_present=%s, "
-        "sha256_format=%s, app_secret_configured=%s",
-        bool(signature),
-        signature.startswith("sha256="),
-        bool(APP_SECRET),
-    )
-
-    if not APP_SECRET:
-        app.logger.error(
-            "META_APP_SECRET is missing from the environment"
-        )
-        return jsonify({"error": "Webhook configuration error"}), 500
-
-    if not signature.startswith("sha256="):
-        app.logger.warning(
-            "Webhook rejected: missing or invalid signature header"
-        )
-        return jsonify({"error": "Invalid signature"}), 401
-
-    expected_signature = "sha256=" + hmac.new(
-        APP_SECRET.encode("utf-8"),
+    expected = "sha256=" + hmac.new(
+        secret.encode("utf-8"),
         raw_body,
         hashlib.sha256
     ).hexdigest()
 
-    if not hmac.compare_digest(signature, expected_signature):
-        app.logger.warning(
-            "Webhook rejected: signature mismatch"
-        )
+    return hmac.compare_digest(signature, expected)
+
+
+@app.post("/webhooks/instagram")
+def receive_webhook():
+    # Read the original bytes before parsing JSON.
+    raw_body = request.get_data(cache=True)
+    signature = request.headers.get("X-Hub-Signature-256", "")
+
+    app.logger.info(
+        "Webhook diagnostic: header_present=%s, "
+        "sha256_format=%s, meta_secret_configured=%s, "
+        "instagram_secret_configured=%s",
+        bool(signature),
+        signature.startswith("sha256="),
+        bool(META_APP_SECRET),
+        bool(INSTAGRAM_APP_SECRET)
+    )
+
+    if not signature.startswith("sha256="):
+        app.logger.warning("Webhook rejected: missing signature")
+        return jsonify({"error": "Invalid signature"}), 401
+
+    meta_match = signature_matches(
+        META_APP_SECRET, signature, raw_body
+    )
+    instagram_match = signature_matches(
+        INSTAGRAM_APP_SECRET, signature, raw_body
+    )
+
+    # Diagnostic only: do not log either secret or the signature.
+    app.logger.info(
+        "Signature diagnostic: meta_secret_match=%s, "
+        "instagram_secret_match=%s",
+        meta_match,
+        instagram_match
+    )
+
+    if not (meta_match or instagram_match):
+        app.logger.warning("Webhook rejected: signature mismatch")
         return jsonify({"error": "Invalid signature"}), 401
 
     payload = request.get_json(silent=True)
 
     if not isinstance(payload, dict):
-        app.logger.warning(
-            "Webhook signature valid, but JSON payload is invalid"
-        )
+        app.logger.warning("Webhook rejected: invalid JSON")
         return jsonify({"error": "Invalid JSON"}), 400
 
-    # Log only basic metadata; do not log message content or customer data.
     app.logger.info(
         "Verified Instagram webhook received; object=%s",
         payload.get("object", "unknown")
@@ -114,3 +118,4 @@ if __name__ == "__main__":
         port=5000,
         debug=False
     )
+    
